@@ -10,6 +10,121 @@ Não esperamos perfeição — esperamos raciocínio claro, código limpo e deci
 
 ---
 
+## Implementation in this repository
+
+The implementation uses TypeScript strict mode, Bun, NestJS, MikroORM's PostgreSQL connection/transaction management, PostgreSQL, and LocalStack SQS. See [ARCHITECTURE.md](./ARCHITECTURE.md) for boundaries, invariants, trade-offs, event delivery semantics, limitations, and Mermaid diagrams.
+
+### Prerequisites
+
+- Bun 1.2.x or newer (Bun is the package manager, runtime, and test runner).
+- Docker Engine and Docker Compose v2 for PostgreSQL and LocalStack.
+- Node.js is not needed for normal local commands.
+
+### Start the local stack
+
+```sh
+docker compose up --build
+```
+
+Compose starts PostgreSQL, LocalStack, applies the versioned migration, then starts the HTTP API and a separate worker. The worker may be scaled to test multiple independent instances; its 90-second stop grace period allows bounded database retries and in-flight SQS acknowledgements to complete before forced termination:
+
+```sh
+docker compose up --build --scale worker=3
+```
+
+The local API is at `http://localhost:3000`; Swagger UI is at `/docs`. Readiness at `/health/ready` requires both PostgreSQL and SQS. The liveness endpoint `/health/live` does not depend on either service.
+
+### Run with Bun outside Compose
+
+```sh
+cp .env.example .env
+bun install
+bun run migration:up
+bun run start:dev
+```
+
+For standalone operation, start PostgreSQL and LocalStack first and make sure the queue URLs in `.env` resolve from the host. Run `bun run start` for the production entry point.
+
+### Migrations
+
+```sh
+bun run migration:up
+bun run migration:down
+```
+
+The down migration intentionally refuses to remove tables while any financial data exists. Take a verified backup and use a reviewed operational retirement procedure rather than deleting audit records.
+
+### API overview
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/wallets` | Create wallet; a positive initial balance creates an OPENING ledger row |
+| `GET` | `/wallets/:walletId` | Read current wallet balance and version |
+| `GET` | `/wallets/:walletId/ledger?cursor=&limit=50` | Stable, opaque cursor-based ledger page |
+| `POST` | `/wallets/:walletId/reconciliation` | Compare materialized balance with the ledger |
+| `POST` | `/wagering/transactions` | Synchronously process a transaction; requires `Idempotency-Key` |
+| `POST` | `/wagering/transactions/queue` | Enqueue an asynchronous transaction |
+| `GET` | `/wagering/transactions/:transactionId` | Read an internal transaction |
+| `GET` | `/providers/:providerId/wagering/transactions/:externalTransactionId` | Read by provider transaction ID |
+| `GET` | `/health/live` | Process liveness |
+| `GET` | `/health/ready` | PostgreSQL and SQS readiness |
+| `GET` | `/metrics` | Prometheus text-format operational gauges |
+
+Example:
+
+```sh
+curl -X POST http://localhost:3000/wallets \
+  -H 'content-type: application/json' \
+  -d '{"playerId":"player-1","initialBalance":{"amount":"100.00","currency":"BRL"}}'
+
+curl -X POST http://localhost:3000/wagering/transactions \
+  -H 'content-type: application/json' \
+  -H 'Idempotency-Key: provider-a:bet-123' \
+  -d '{"providerId":"provider-a","externalTransactionId":"bet-123","playerId":"player-1","walletId":"<wallet-id>","roundId":"round-1","gameId":"game-1","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}'
+```
+
+Processed transactions return `200`, pending references `202`, business rejections `422`, conflicts `409`, invalid contracts `400`, and transient dependency failures `503`. The response includes a durable result snapshot and `idempotentReplay`.
+
+### Tests and verification
+
+Run database and messaging tests only against the dedicated disposable stack, never the development or production database:
+
+```sh
+set -eu
+docker compose -f docker-compose.test.yml up -d --wait
+trap 'docker compose -f docker-compose.test.yml down --remove-orphans' EXIT
+set -a
+. ./.env.test.example
+set +a
+DATABASE_URL="$TEST_DATABASE_URL" bun run migration:up
+bun run test:unit
+bun run test:integration
+bun run test:concurrency
+```
+
+The test database name must end in `_test`; test suites reject other database names. This stack has no persistent volumes and uses separate host ports (`55432` for PostgreSQL and `14566` for LocalStack). If a test run is interrupted, inspect the test stack and stop it explicitly.
+
+The concurrency suite creates three independent MikroORM/PostgreSQL connection pools, sends 50 duplicates through three OS processes, and exercises the two-80-against-100 race and independent wallets. Integration suites are skipped unless the explicit test service URLs are configured. The test LocalStack stack initializes FIFO transaction, DLQ, event, and crash-recovery queues. Do not point these tests at a production database.
+
+Other checks:
+
+```sh
+bun run build
+bun run lint
+docker compose ps
+curl -f http://localhost:3000/health/ready
+```
+
+### Troubleshooting and limitations
+
+- If readiness is `503`, verify PostgreSQL health and LocalStack queue initialization with `docker compose ps` and `docker compose logs localstack postgres`.
+- If the migration refuses to roll back, that is intentional: it protects existing financial history.
+- Local credentials are placeholders for LocalStack only; do not reuse them in AWS.
+- Authentication is intentionally not implemented; the provider identity integration seam and required deployment warning are documented in [ARCHITECTURE.md](./ARCHITECTURE.md).
+- Real container-backed tests require Docker and a disposable PostgreSQL/LocalStack setup. Do not treat skipped tests as passed.
+
+---
+
 ## 1. Visão geral
 
 Construa um serviço financeiro distribuído que processe transações de apostas recebidas de múltiplos provedores de jogos.
