@@ -1,0 +1,31 @@
+services:
+  postgres-test:
+    image: postgres:16.6-alpine
+    environment:
+      POSTGRES_DB: wagering_test
+      POSTGRES_USER: wager
+      POSTGRES_PASSWORD: wager
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wager -d wagering_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  localstack-test:
+    image: localstack/localstack:4.0
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      PERSISTENCE: "0"
+    ports:
+      - "14566:4566"
+    volumes:
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/10-create-queues.sh:ro
+      - ./scripts/localstack-test-init.sh:/etc/localstack/init/ready.d/20-create-test-queue.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
